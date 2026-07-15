@@ -169,7 +169,14 @@ class AgentDVRMediaSource(MediaSource):
         if extension not in PLAYABLE_EXTENSIONS:
             raise Unresolvable("MKV recordings are not playable in a browser")
 
-        # Return a same-origin path (no query string) so Home Assistant signs it
-        # for playback and the browser streams via our proxy, not AgentDVR.
+        # Return a same-origin path so Home Assistant signs it for playback and
+        # the browser streams via our proxy, not AgentDVR. The file size travels
+        # as ``len`` so the proxy can answer byte-range requests: AgentDVR's
+        # streamFile.cgi is chunked and range-blind, and iOS/macOS AVPlayer will
+        # not play a clip whose server can't serve ranges.
+        client = self._client()
+        size = await client.async_get_recording_size(oid, ot, filename)
         url = f"/api/agentdvr/stream/{oid}/{ot}/{filename}"
+        if size:
+            url += f"?len={size}"
         return PlayMedia(url=url, mime_type="video/mp4")

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from aiohttp import ClientError, web
+from aiohttp import ClientError, ClientResponse, web
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
@@ -29,6 +29,50 @@ def _client(hass: HomeAssistant) -> AgentDVRClient | None:
     if not entries or getattr(entries[0], "runtime_data", None) is None:
         return None
     return entries[0].runtime_data
+
+
+def _content_length(upstream: ClientResponse) -> int | None:
+    """Total body length from the upstream response, if it advertised one."""
+    raw = upstream.headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _parse_range(header: str | None, total: int | None) -> tuple[int, int] | None:
+    """Resolve a single ``bytes=`` range to inclusive (start, end) offsets.
+
+    Returns ``None`` when there is no range, the total size is unknown, the
+    syntax is unsupported (multi-range/invalid), or the range is unsatisfiable —
+    callers then fall back to sending the whole body.
+    """
+    if not header or total is None or "," in header:
+        return None
+    units, _, spec = header.partition("=")
+    if units.strip().lower() != "bytes":
+        return None
+    start_s, sep, end_s = spec.strip().partition("-")
+    if not sep:
+        return None
+    try:
+        if not start_s:
+            # Suffix range: bytes=-N -> last N bytes.
+            length = int(end_s)
+            if length <= 0:
+                return None
+            start = max(0, total - length)
+            return start, total - 1
+        start = int(start_s)
+        end = int(end_s) if end_s else total - 1
+    except ValueError:
+        return None
+    end = min(end, total - 1)
+    if start > end or start < 0:
+        return None
+    return start, end
 
 
 class AgentDVRMediaView(HomeAssistantView):
@@ -69,13 +113,24 @@ class AgentDVRMediaView(HomeAssistantView):
         except (ValueError, IndexError) as err:
             raise web.HTTPBadRequest from err
 
+        # Forward the client's Range header so byte-serving works end to end.
+        # iOS/macOS AVPlayer (the Home Assistant mobile app's video player)
+        # probes with a Range request and refuses to play unless the server
+        # answers 206 Partial Content with Accept-Ranges, hence the crossed-out
+        # play button. Passing the header through lets AgentDVR do the slicing.
+        headers = {}
+        if kind == "stream" and (rng := request.headers.get("Range")):
+            headers["Range"] = rng
+
         try:
-            upstream = await client.session.get(upstream_url, auth=client.auth)
+            upstream = await client.session.get(
+                upstream_url, auth=client.auth, headers=headers or None
+            )
         except ClientError as err:
             _LOGGER.error("AgentDVR media request failed: %s", err)
             raise web.HTTPBadGateway from err
 
-        if upstream.status != 200:
+        if upstream.status not in (200, 206):
             upstream.release()
             raise web.HTTPBadGateway
 
@@ -87,13 +142,75 @@ class AgentDVRMediaView(HomeAssistantView):
                 upstream.release()
             return web.Response(body=body, content_type="image/jpeg")
 
-        # Streams: relay chunks so large files aren't buffered in memory.
-        downstream = web.StreamResponse(
-            status=200, headers={"Content-Type": "video/mp4"}
+        # Streams: always advertise range support and relay chunks so large
+        # files aren't buffered in memory.
+        resp_headers = {
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes",
+        }
+
+        if upstream.status == 206:
+            # AgentDVR honoured the range: mirror its 206 verbatim.
+            for header in ("Content-Length", "Content-Range"):
+                if (value := upstream.headers.get(header)) is not None:
+                    resp_headers[header] = value
+            return await self._relay(request, upstream, 206, resp_headers)
+
+        # Upstream returned the whole file (200) — streamFile.cgi is chunked and
+        # ignores Range. If the client asked for a range, slice the response
+        # ourselves; without this, AVPlayer gets a 200 to its range probe and
+        # refuses to play. The total size can't come from the chunked upstream,
+        # so it rides in on ``len`` (set when the media source resolves the URL).
+        total = _content_length(upstream)
+        if total is None and (len_q := request.query.get("len")):
+            try:
+                total = int(len_q)
+            except ValueError:
+                total = None
+        rng = _parse_range(request.headers.get("Range"), total)
+        if rng is None:
+            if total is not None:
+                resp_headers["Content-Length"] = str(total)
+            return await self._relay(request, upstream, 200, resp_headers)
+
+        start, end = rng  # inclusive, satisfiable against a known total
+        resp_headers["Content-Length"] = str(end - start + 1)
+        resp_headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return await self._relay(
+            request, upstream, 206, resp_headers, skip=start, length=end - start + 1
         )
+
+    @staticmethod
+    async def _relay(
+        request: web.Request,
+        upstream: ClientResponse,
+        status: int,
+        headers: dict[str, str],
+        *,
+        skip: int = 0,
+        length: int | None = None,
+    ) -> web.StreamResponse:
+        """Stream upstream bytes to the client, optionally slicing a range.
+
+        ``skip`` bytes are discarded from the front and at most ``length`` bytes
+        are forwarded (used when we honour a range the upstream ignored).
+        """
+        downstream = web.StreamResponse(status=status, headers=headers)
         await downstream.prepare(request)
+        remaining = length
         try:
             async for chunk in upstream.content.iter_chunked(STREAM_CHUNK):
+                if skip:
+                    if len(chunk) <= skip:
+                        skip -= len(chunk)
+                        continue
+                    chunk = chunk[skip:]
+                    skip = 0
+                if remaining is not None:
+                    if len(chunk) >= remaining:
+                        await downstream.write(chunk[:remaining])
+                        break
+                    remaining -= len(chunk)
                 await downstream.write(chunk)
         except (ClientError, ConnectionResetError) as err:
             _LOGGER.debug("AgentDVR stream ended: %s", err)

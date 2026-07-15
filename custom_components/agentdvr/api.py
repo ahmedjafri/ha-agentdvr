@@ -166,6 +166,22 @@ class AgentDVRClient:
         recordings.sort(key=lambda r: r.unix_ts, reverse=True)
         return recordings[:limit] if limit else recordings
 
+    async def async_get_recording_size(
+        self, oid: int, ot: int, filename: str
+    ) -> int | None:
+        """Return a recording's size in bytes from its event metadata.
+
+        ``streamFile.cgi`` serves recordings chunked with no ``Content-Length``,
+        so the size the range-proxy needs comes from the event's ``sb`` field.
+        """
+        data = await self._get_json(
+            "/q/getEvents", oid=oid, ot=ot, compress="false"
+        )
+        for ev in data.get("events", []):
+            if ev.get("fn") == filename and ev.get("sb") is not None:
+                return int(ev["sb"])
+        return None
+
     # ------------------------------------------------------------------ #
     # Browser-facing URL builders (absolute)
     # ------------------------------------------------------------------ #
